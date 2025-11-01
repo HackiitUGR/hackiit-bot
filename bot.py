@@ -133,10 +133,14 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if decision == "accept":
         try:
             group_id = int(os.getenv("GROUP_ID"))
-            await context.bot.add_chat_member(chat_id=group_id, user_id=user_id)
+            invite_link_obj = await context.bot.create_chat_invite_link(
+                chat_id=group_id,
+                member_limit=1
+            )
+            invite_link = invite_link_obj.invite_link
             await context.bot.send_message(
                 chat_id=user_id,
-                text="🎉 ¡Tu writeup ha sido aceptado! Ya formas parte de Hackiit."
+                text=f"🎉 ¡Tu writeup ha sido aceptado! Ya formas parte de Hackiit. Invitación: {invite_link}"
             )
             await query.edit_message_caption(caption=f"✅ Writeup de @{user_info['username']} aceptado y añadido al grupo.")
         except Exception as e:
