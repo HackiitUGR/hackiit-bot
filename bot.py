@@ -11,8 +11,8 @@ from requests.exceptions import RequestException
 
 VIRUS_TOTAL_URL = "https://www.virustotal.com/api/v3/files"
 DATA_FILE = "data/reviewers.json"
-
 VIRUS_TOTAL_REPORT_URL = "https://www.virustotal.com/api/v3/analyses/{0}" 
+EXPECTED_MIME_TYPE = "application/pdf"
 
 
 # ---------- Utility functions ----------
@@ -39,7 +39,7 @@ async def check_virus_total(document, telegram_file):
         await telegram_file.download_to_drive(file_path)
 
         with open(file_path, 'rb') as file_data:
-            files = { "file": (document.file_name, file_data, "application/pdf") }
+            files = { "file": (document.file_name, file_data, EXPECTED_MIME_TYPE) }
             print('VT LOG: Subiendo fichero a VirusTotal...')
 
             # Upload
@@ -110,14 +110,20 @@ async def check_virus_total(document, telegram_file):
 # Load the file where the bot's persistent state (reviewers, pending, blocked) will be saved
 def load_data():
     if not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0:
-        return {"reviewers": [], "pending": {}, "blocked": [], "next_index": 0}
+        # Initializing with 'user_assignments'
+        return {"reviewers": [], "pending": {}, "blocked": [], "next_index": 0, "user_assignments": {}} 
 
     try:
         with open(DATA_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            # Ensure 'user_assignments' exists when loading
+            if "user_assignments" not in data:
+                data["user_assignments"] = {}
+            return data
     except json.JSONDecodeError:
         print("⚠️ Advertencia: Archivo de datos vacío o corrupto. Inicializando.")
-        return {"reviewers": [], "pending": {}, "blocked": [], "next_index": 0}
+        # Initializing with 'user_assignments'
+        return {"reviewers": [], "pending": {}, "blocked": [], "next_index": 0, "user_assignments": {}}
 
 # Saves the current data to the JSON file.
 def save_data(data):
@@ -125,15 +131,43 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-# Gets the ID of the next reviewer using a round-robin rotation system.
-def get_next_reviewer(data):
+# Gets the ID of the next reviewer using a round-robin rotation system (only for initial assignment).
+def get_next_reviewer_round_robin(data):
     reviewers = data.get("reviewers", [])
     if not reviewers:
         return None
+
     reviewer = reviewers[data["next_index"] % len(reviewers)]
     data["next_index"] = (data["next_index"] + 1) % len(reviewers)
     save_data(data)
     return reviewer
+
+# Gets the user's fixed reviewer or assigns a new one.
+def get_user_reviewer(user_id, data):
+    user_id_str = str(user_id)
+    assignments = data.get("user_assignments", {})
+    reviewers_list = data.get("reviewers", [])
+
+    # 1. Check if the user already has an assigned reviewer and if they are still active
+    if user_id_str in assignments:
+        reviewer_id = assignments[user_id_str]
+
+        if reviewer_id in reviewers_list:
+            return reviewer_id # Return the existing fixed reviewer
+        else:
+            print(f"⚠️ Revisor {reviewer_id} asignado a usuario {user_id} ya no es revisor. Reasignando...")
+
+
+    # 2. Assign a new one via round-robin
+    new_reviewer_id = get_next_reviewer_round_robin(data)
+
+    if new_reviewer_id is not None:
+        # Save the new assignment
+        data["user_assignments"][user_id_str] = new_reviewer_id
+        save_data(data)
+        return new_reviewer_id
+
+    return None # No reviewers available
 
 # Checks if a user is in the blocked list.
 def is_blocked(user_id, data):
@@ -176,30 +210,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Estás bloqueado y no puedes enviar writeups.")
         return
 
-    # 2. Format check: only accepts PDF files.
-    if not file.file_name.lower().endswith(".pdf") and file.mime_type != "application/pdf":
-        await update.message.reply_text("Solo se aceptan archivos PDF.")
+    # 2. Format check: Extension and MIME type
+    if not file.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("Solo se aceptan archivos PDF (extensión .pdf).")
         return
 
-    # 3. Check file with Virus Total
+    if file.mime_type != EXPECTED_MIME_TYPE:
+        print(f"⚠️ Archivo con MIME type incorrecto: {file.mime_type} (esperado: {EXPECTED_MIME_TYPE})")
+        await update.message.reply_text(
+            "❌ El formato de archivo no es válido (MIME type incorrecto)."
+        )
+        return
+
+    # 3. Get file object for Virus Total
     file_id = file.file_id
     telegram_file = await context.bot.get_file(file_id)
 
+    # 4. Check file with Virus Total
     await update.message.reply_text("⏳ Analizando el archivo con VirusTotal. Esto puede tardar un momento...")
 
-    check = await check_virus_total(file, telegram_file)
+    check = await check_virus_total(file, telegram_file) 
+
     if not check:
-        # La función check_virus_total ya imprimió el error en la consola
         await update.message.reply_text("❌ Fichero sospechoso o la verificación de seguridad falló. Por favor, inténtalo con otro archivo.")
         return
 
-    # 4. Assigns the next reviewer via rotation.
-    reviewer_id = get_next_reviewer(data)
+    # 5. Assigns the fixed reviewer.
+    # We use the new function to get the fixed reviewer
+    reviewer_id = get_user_reviewer(user.id, data) 
+
     if reviewer_id is None:
         await update.message.reply_text("No hay revisores configurados. Inténtalo más tarde.")
         return
 
-    # 5. Save pending status: registers the request before sending it.
+    # 6. Save pending status: registers the request before sending it.
+    # Reload data to get the fixed assignment if it was just created
+    data = load_data() 
     data["pending"][str(user.id)] = {
         "username": user.username,
         "file_id": file.file_id,
@@ -207,13 +253,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_data(data)
 
-    # 6. Forward the file to the reviewer with action buttons.
+    # 7. Forward the file to the reviewer with action buttons.
     try:
         await context.bot.send_document(
             chat_id=reviewer_id,
             document=file.file_id,
             caption=(
                 f"📄 Nuevo writeup recibido de @{user.username or user.full_name}\n"
+                f"(Asignado: {user.username or user.full_name})"
             ),
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -262,6 +309,7 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"🎉 ¡Tu writeup ha sido aceptado! Ya formas parte de Hackiit. Invitación: {invite_link}"
             )
             await query.edit_message_caption(caption=f"✅ Writeup de @{user_info['username']} aceptado y añadido al grupo.")
+
         except Exception as e:
             await query.edit_message_caption(caption=f"⚠️ Error al añadir al usuario: {e}")
             print(f"Error al intentar añadir usuario: {e}")
@@ -369,7 +417,7 @@ async def remove_reviewer_command(update: Update, context: ContextTypes.DEFAULT_
 
     if reviewer_id in data.get("reviewers", []):
         data["reviewers"].remove(reviewer_id)
-        # Ajustamos el índice de rotación
+        # Adjust rotation index
         if data["reviewers"]:
             data["next_index"] = data["next_index"] % len(data["reviewers"])
         else:
